@@ -19,6 +19,10 @@ on:
         description: "Lấy toàn bộ lịch sử (--full)"
         type: boolean
         default: false
+      rebuild:
+        description: "Thay toàn bộ bảng trong database bằng dữ liệu mới (chỉ cần 1 lần)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -34,6 +38,7 @@ jobs:
     env:
       SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || (github.event.schedule == '43 1 * * 1' && 'seasonal' || 'daily') }}
       FULL: ${{ inputs.full && '--full' || '' }}
+      REBUILD: ${{ inputs.rebuild && '--rebuild' || '' }}
       HAS_DB: ${{ secrets.GCP_SA_KEY != '' && secrets.DB_PASS != '' }}
     steps:
       - uses: actions/checkout@v4
@@ -80,5 +85,5 @@ jobs:
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASS: ${{ secrets.DB_PASS }}
         run: |
-          if [ "$SCOPE" != seasonal ]; then python update_daily.py; fi
-          if [ "$SCOPE" != daily ]; then python update_seasonal.py; fi
+          if [ "$SCOPE" != seasonal ]; then python update_daily.py $REBUILD; fi
+          if [ "$SCOPE" != daily ]; then python update_seasonal.py $REBUILD; fi
