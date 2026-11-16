@@ -1,62 +1,56 @@
-from selenium import webdriver
-from tqdm import tqdm
-from selenium.webdriver.common.by import By
+"""Crawl cơ cấu cổ đông & sở hữu nước ngoài từ VNDirect (dữ liệu snapshot)."""
 import pandas as pd
+from bs4 import BeautifulSoup
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm
-from time import sleep
-import re
-import random as rd
-from unidecode import unidecode
-from bs4 import BeautifulSoup  
 
-BANKS_CODE = ['ACB', 'BID', 'CTG', 'EIB', 'HDB', 
-              'LVB', 'MBB', 'MSB', 'OCB', 'STB', 
-              'SSB', 'TCB', 'TPB', 'VCB', 'VIB', 
-              'VPB']
+from config import BANKS, WAIT_TIMEOUT, vndirect_url
+from utils import log, make_driver, polite_pause, result_path
 
-driver = webdriver.Firefox()
-global_shareholder_df = pd.DataFrame()
-global_foreign_df = pd.DataFrame()
-for bank in tqdm(BANKS_CODE):
-    if bank=='LVB':
-        bank = 'LPB'
-    sleep(rd.randint(15,30))
-    crawl_url = f"https://dstock.vndirect.com.vn/tong-quan/{bank}/co-cau-so-huu-popup?tabDefault=shareholders"
-    driver.get(crawl_url)
-    sleep(rd.randint(15,30))
-    driver.execute_script("window.scrollTo(0, 2300)") 
-    sleep(rd.randint(15,30))
-    
-    shareholder_df = pd.DataFrame(columns=['shareholder_name', 'number', 'own_(%)'])
-    html_text = driver.page_source
-    soup = BeautifulSoup(html_text, "html.parser")
-    text_elements = soup.find_all('td', class_='text-left')
-    values_elements = soup.find_all('td', class_='nowrap')
-    flag = 0
-    for shareholder in tqdm(text_elements):
-        shareholder_name = shareholder.get_text()
-        number = values_elements[flag].get_text()
-        flag+=1
-        own_number = values_elements[flag].get_text().replace('%','')
-        flag+=1
-        shareholder_df.loc[len(shareholder_df)] = [shareholder_name, number, own_number]
-    xpath_path = """Sở hữu NN"""
-    element = driver.find_element(By.LINK_TEXT, xpath_path)
-    element.click()
-    sleep(rd.randint(15,30))
-    shareholder_df['Bank'] = bank
-    
-    html_text = driver.page_source
-    soup = BeautifulSoup(html_text, "html.parser")
-    text_elements = soup.find_all('td', class_='text-left')
-    values_elements = soup.find_all('td', class_='nowrap')
-    text_elements = [i.get_text() for i in text_elements]
-    values_elements = [i.get_text().replace('%','') for i in values_elements]
-    foreign_df = pd.DataFrame.from_dict({'metric': text_elements, 'own_(%)': values_elements})
-    foreign_df['Bank'] = bank
-    
-    global_shareholder_df = pd.concat([global_shareholder_df, shareholder_df], axis=0)
-    global_foreign_df = pd.concat([global_foreign_df, foreign_df], axis=0)
-    global_foreign_df.to_csv('results/co-dong-nuoc-ngoai.csv', index=False)
-    global_shareholder_df.to_csv('results/co-dong-tong-quan.csv', index=False)
-driver.close()
+
+def cells(html):
+    soup = BeautifulSoup(html, "html.parser")
+    return ([td.get_text() for td in soup.find_all('td', class_='text-left')],
+            [td.get_text() for td in soup.find_all('td', class_='nowrap')])
+
+
+shareholders, foreigners = [], []
+driver = make_driver()
+wait = WebDriverWait(driver, WAIT_TIMEOUT)
+try:
+    for bank in tqdm(BANKS):
+        code = bank['code']
+        try:
+            polite_pause()
+            driver.get(vndirect_url(bank))
+            driver.execute_script("window.scrollTo(0, 2300)")
+            first = wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'td.text-left')))
+
+            names, values = cells(driver.page_source)
+            if len(values) < 2 * len(names):
+                log.warning("%s: thiếu giá trị cổ đông (%d tên, %d ô)",
+                            code, len(names), len(values))
+            for i, name in enumerate(names[:len(values) // 2]):
+                shareholders.append([name, values[2 * i],
+                                     values[2 * i + 1].replace('%', ''), code])
+
+            wait.until(EC.element_to_be_clickable(
+                (By.LINK_TEXT, "Sở hữu NN"))).click()
+            wait.until(EC.staleness_of(first))
+            wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'td.text-left')))
+            names, values = cells(driver.page_source)
+            for name, value in zip(names, values):
+                foreigners.append([name, value.replace('%', ''), code])
+        except Exception:
+            log.exception("Lỗi khi crawl %s", code)
+finally:
+    driver.quit()
+
+pd.DataFrame(shareholders, columns=['shareholder_name', 'number', 'own_(%)', 'Bank']) \
+    .to_csv(result_path('co-dong-tong-quan.csv'), index=False)
+pd.DataFrame(foreigners, columns=['metric', 'own_(%)', 'Bank']) \
+    .to_csv(result_path('co-dong-nuoc-ngoai.csv'), index=False)

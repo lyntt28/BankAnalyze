@@ -1,30 +1,8 @@
-import os
 import pandas as pd
-from tqdm import tqdm
-from google.cloud.sql.connector import Connector
-import sqlalchemy
 
-connector = Connector()
-INSTANCE_CONNECTION_NAME = "data-engineer-379601:asia-southeast1:bankstock"
-DB_USER = "dashboard"
-DB_PASS = "dashboard"
+from db import get_engine, upsert
+from utils import log, result_path
 
-def getconn():
-    conn = connector.connect(
-        INSTANCE_CONNECTION_NAME,
-        "pymysql",
-        user=DB_USER,
-        password=DB_PASS,
-        db="DAILY"
-    )
-    return conn
-
-pool = sqlalchemy.create_engine(
-    "mysql+pymysql://",
-    creator=getconn,
-)
-DB_CONN = pool.connect()
-file ='stock_history.csv'
-data = pd.read_csv('results/'+file)
-name = file.replace('.csv','')
-data.to_sql(name, DB_CONN, if_exists='replace', index=False)
+data = pd.read_csv(result_path('stock_history.csv'))
+n = upsert(get_engine("DAILY"), 'stock_history', data, ['Date', 'Bank'])
+log.info("stock_history: upsert %d dòng", n)

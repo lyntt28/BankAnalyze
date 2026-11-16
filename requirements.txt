@@ -1,0 +1,9 @@
+pandas>=2.0
+selenium>=4.10
+beautifulsoup4
+unidecode
+tqdm
+sqlalchemy>=2.0
+pymysql
+cloud-sql-python-connector[pymysql]
+python-dotenv
