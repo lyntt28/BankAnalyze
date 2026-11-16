@@ -4,7 +4,7 @@ from datetime import date
 import pandas as pd
 
 from config import BANKS_CODE, DEBT_GROUP_CODE, RECENT_QUARTERS, RECENT_YEARS
-from utils import cafef_get, finish, for_each_bank, log, merge_incremental, result_path, slug
+from utils import ApiError, cafef_get, finish, for_each_bank, log, merge_incremental, result_path, slug
 
 QUARTER = 'quy'
 YEAR = 'nam'
@@ -54,20 +54,41 @@ def fetch_debt(bank, kind, full):
 
 
 def fetch_finance(bank, kind, full):
-    """Các chỉ tiêu chính (doanh thu, LNTT, chi phí, LN ròng)."""
+    """Các chỉ tiêu chính (doanh thu, LNTT, chi phí, LN ròng).
+
+    API báo lỗi nếu TotalRow vượt quá số kỳ có sẵn, nên lấy từng đợt và lùi
+    EndDate dần về quá khứ.
+    """
     today = date.today()
-    total = 200 if full else (RECENT_YEARS if kind == YEAR else RECENT_QUARTERS)
-    end = str(today.year) if kind == YEAR else f"{(today.month - 1) // 3 + 1}-{today.year}"
-    data = cafef_get('FinanceReport.ashx', Type=1, Symbol=bank, TotalRow=total,
-                     EndDate=end, ReportType='NAM' if kind == YEAR else 'QUY',
-                     Sort='DESC')
-    rows = []
-    for p in data.get('Value') or []:
-        label = _period_label(kind, p['Year'], p['Quater'])
-        for v in p['Value']:
-            # API trả đơn vị nghìn đồng -> đổi sang tỷ đồng
-            value = None if v['Value'] is None else v['Value'] / 1e6
-            rows.append([label, slug(v['Name']), value, bank])
+    year, quarter = today.year, (today.month - 1) // 3 + 1
+    limit = None if full else (RECENT_YEARS if kind == YEAR else RECENT_QUARTERS)
+    chunk = 20 if full else limit
+    rows, seen = [], set()
+    while limit is None or len(seen) < limit:
+        end = str(year) if kind == YEAR else f"{quarter}-{year}"
+        try:
+            data = cafef_get('FinanceReport.ashx', Type=1, Symbol=bank, TotalRow=chunk,
+                             EndDate=end, ReportType='NAM' if kind == YEAR else 'QUY',
+                             Sort='DESC')
+        except ApiError:
+            if chunk > 1:
+                chunk = max(1, chunk // 4)  # vượt quá số kỳ có sẵn: thử đợt nhỏ hơn
+                continue
+            if not seen:
+                raise
+            break  # đã tới kỳ cũ nhất có dữ liệu
+        new = [p for p in data.get('Value') or [] if (p['Year'], p['Quater']) not in seen]
+        if not new:
+            break
+        for p in new:
+            seen.add((p['Year'], p['Quater']))
+            label = _period_label(kind, p['Year'], p['Quater'])
+            for v in p['Value']:
+                # API trả đơn vị nghìn đồng -> đổi sang tỷ đồng
+                value = None if v['Value'] is None else v['Value'] / 1e6
+                rows.append([label, slug(v['Name']), value, bank])
+        oldest = min((p['Year'], p['Quater']) for p in new)
+        year, quarter = _prev(kind, oldest[0], oldest[1] if kind == QUARTER else 0)
     return rows
 
 

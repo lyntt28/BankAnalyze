@@ -24,6 +24,10 @@ _session.headers.update({
 })
 
 
+class ApiError(ValueError):
+    """API trả về Success=false (lỗi logic, retry không giúp được)."""
+
+
 def cafef_get(endpoint, **params):
     """GET một endpoint JSON của cafef, có retry + backoff. Trả về trường Data."""
     url = f"{CAFEF_API}/{endpoint}"
@@ -33,15 +37,16 @@ def cafef_get(endpoint, **params):
             r = _session.get(url, params=params, timeout=HTTP_TIMEOUT)
             r.raise_for_status()
             body = r.json()
-            if not body.get("Success", True):
-                raise ValueError(f"API báo lỗi: {body.get('Message')}")
-            return body["Data"]
         except Exception as e:
             if attempt == HTTP_RETRIES:
                 raise
             wait = 2 ** attempt
             log.warning("%s %s lỗi (%s), thử lại sau %ds", endpoint, params, e, wait)
             time.sleep(wait)
+            continue
+        if not body.get("Success", True):
+            raise ApiError(f"API báo lỗi: {body.get('Message')}")
+        return body["Data"]
 
 
 def for_each_bank(banks, fn):
