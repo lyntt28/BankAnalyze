@@ -1,103 +1,107 @@
-"""Hàm dùng chung: driver, chờ phần tử, parse dòng, gộp dữ liệu tăng dần."""
+"""Hàm dùng chung: gọi API cafef, log, gộp CSV tăng dần."""
+import argparse
 import logging
 import os
 import random
-import re
-from time import sleep
+import time
 
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+import requests
 from unidecode import unidecode
 
-from config import POLITE_DELAY, RESULTS_DIR, WAIT_TIMEOUT
+from config import (CAFEF_API, HTTP_RETRIES, HTTP_TIMEOUT, POLITE_DELAY,
+                    RESULTS_DIR)
 
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bankanalyze")
 
-
-def make_driver():
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    return webdriver.Firefox()
-
-
-def polite_pause():
-    sleep(random.uniform(*POLITE_DELAY))
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Referer": "https://cafef.vn/",
+})
 
 
-def wait_xpath(driver, xpath, clickable=False):
-    cond = EC.element_to_be_clickable if clickable else EC.presence_of_element_located
-    return WebDriverWait(driver, WAIT_TIMEOUT).until(cond((By.XPATH, xpath)))
-
-
-def wait_text_change(driver, xpath, old_text):
-    """Chờ nội dung phần tử đổi sau khi bấm tab (AJAX). Tìm lại phần tử mỗi
-    lần kiểm tra vì trang có thể thay thế cả node."""
-    def changed(d):
+def cafef_get(endpoint, **params):
+    """GET một endpoint JSON của cafef, có retry + backoff. Trả về trường Data."""
+    url = f"{CAFEF_API}/{endpoint}"
+    for attempt in range(1, HTTP_RETRIES + 1):
+        time.sleep(random.uniform(*POLITE_DELAY))
         try:
-            text = d.find_element(By.XPATH, xpath).text
+            r = _session.get(url, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            body = r.json()
+            if not body.get("Success", True):
+                raise ValueError(f"API báo lỗi: {body.get('Message')}")
+            return body["Data"]
+        except Exception as e:
+            if attempt == HTTP_RETRIES:
+                raise
+            wait = 2 ** attempt
+            log.warning("%s %s lỗi (%s), thử lại sau %ds", endpoint, params, e, wait)
+            time.sleep(wait)
+
+
+def for_each_bank(banks, fn):
+    """Chạy fn(bank) cho từng ngân hàng; lỗi ở một ngân hàng không làm dừng cả lượt.
+
+    Trả về (list kết quả, list ngân hàng lỗi).
+    """
+    results, failed = [], []
+    for bank in banks:
+        try:
+            results.append(fn(bank))
         except Exception:
-            return False
-        return text if text.strip() and text != old_text else False
-    return WebDriverWait(driver, WAIT_TIMEOUT).until(changed)
+            log.exception("%s: lỗi, bỏ qua", bank)
+            failed.append(bank)
+    return results, failed
+
+
+def slug(text):
+    text = unidecode(str(text)).replace('(', ' ').replace(')', ' ').replace('*', ' ')
+    return '-'.join(text.lower().split())
 
 
 def result_path(name):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     return os.path.join(RESULTS_DIR, name)
 
 
-def parse_feature_line(line, bank, is_value, name_map=None):
-    """Tách một dòng 'Tên chỉ tiêu 1,23 4,56 ...' thành [feature, bank, v1, v2...].
-
-    Trả về None nếu dòng không có giá trị nào.
-    """
-    feature_name = ''
-    out = []
-    for token in line.split(' '):
-        token = token.strip()
-        if not is_value(token):
-            feature_name = f'{feature_name} {token}'
-        elif not feature_name.strip():
-            out.append(token)
-        else:
-            key = unidecode(feature_name.strip()).replace(' ', '-').lower()
-            out += [name_map.get(key) if name_map else key, bank, token]
-            feature_name = ''
-    return out or None
-
-
-def add_row(table, row, context):
-    """Thêm dòng vào bảng; nếu số cột không khớp thì log thay vì bỏ qua im lặng."""
-    if row is None:
-        return
-    if len(row) != len(table.columns):
-        log.warning("Bỏ dòng %s: có %d giá trị, cần %d: %r",
-                    context, len(row), len(table.columns), row)
-        return
-    table.loc[len(table)] = row
-
-
-def merge_incremental(path, new_data, key_cols):
+def merge_incremental(path, new_data, key_cols, sort_cols=None):
     """Gộp dữ liệu mới vào CSV cũ.
 
     Dòng trùng khoá thì lấy bản mới (số liệu có thể được kiểm toán lại), dòng
-    cũ không còn hiển thị trên web vẫn được giữ.
+    cũ không còn trên web vẫn được giữ.
     """
     if os.path.exists(path):
-        old = pd.read_csv(path, dtype=str)
+        old = pd.read_csv(path)
         log.info("%s: đã có %d dòng", path, len(old))
     else:
         old = pd.DataFrame(columns=new_data.columns)
-    new_data = new_data.astype(str)
+    for c in key_cols:  # so khoá dạng chuỗi để tránh lệch kiểu int/str
+        old[c] = old[c].astype(str)
+        new_data[c] = new_data[c].astype(str)
     merged = (pd.concat([old, new_data], ignore_index=True)
               .drop_duplicates(subset=key_cols, keep='last'))
-    added = len(merged) - len(old)
+    if sort_cols:
+        merged = merged.sort_values(sort_cols, kind='stable')
     merged.to_csv(path, index=False)
-    log.info("%s: +%d dòng mới, tổng %d", path, added, len(merged))
+    log.info("%s: +%d dòng mới, tổng %d", path, len(merged) - len(old), len(merged))
     return merged
 
 
-DATE_RE = re.compile(r'^\d{2}/\d{2}/\d{4}\b')
+def finish(failed):
+    """Thoát với mã lỗi nếu có ngân hàng crawl thất bại (để CI báo đỏ)."""
+    if failed:
+        log.error("Các ngân hàng lỗi: %s", ", ".join(failed))
+        raise SystemExit(1)
+
+
+def cli(description):
+    p = argparse.ArgumentParser(description=description)
+    p.add_argument('--full', action='store_true',
+                   help='lấy toàn bộ lịch sử thay vì chỉ các kỳ gần nhất')
+    p.add_argument('--banks', nargs='+', help='chỉ chạy các mã này')
+    return p.parse_args()

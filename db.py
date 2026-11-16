@@ -2,9 +2,7 @@
 KHÔNG ghi trong code."""
 import os
 
-import pandas as pd
 import sqlalchemy
-from google.cloud.sql.connector import Connector
 
 try:
     from dotenv import load_dotenv
@@ -21,6 +19,7 @@ def _env(name):
 
 
 def get_engine(db_name):
+    from google.cloud.sql.connector import Connector  # chỉ cần khi kết nối thật
     connector = Connector()
 
     def getconn():
@@ -41,18 +40,25 @@ def upsert(engine, table, data, key_cols):
         if not insp.has_table(table):
             data.to_sql(table, conn, index=False)
             return len(data)
-        keys = data[key_cols].drop_duplicates()
+        existing = {c['name'] for c in insp.get_columns(table)}
+        for col in data.columns:
+            if col not in existing:  # schema mới có thêm cột -> tự thêm
+                conn.execute(sqlalchemy.text(
+                    f"ALTER TABLE `{table}` ADD COLUMN `{col}` TEXT NULL"))
+        keys = data[key_cols].drop_duplicates().astype(str)
         tmp = f"_tmp_{table}"
         keys.to_sql(tmp, conn, if_exists='replace', index=False)
-        on = " AND ".join(f"t.`{c}` = k.`{c}`" for c in key_cols)
+        cols = ", ".join(f"`{c}`" for c in key_cols)
+        # So khoá dạng chuỗi để không lệch kiểu giữa dữ liệu cũ và mới
+        lhs = ", ".join(f"CAST(`{c}` AS CHAR)" for c in key_cols)
         conn.execute(sqlalchemy.text(
-            f"DELETE t FROM `{table}` t JOIN `{tmp}` k ON {on}"))
+            f"DELETE FROM `{table}` WHERE ({lhs}) IN (SELECT {cols} FROM `{tmp}`)"))
         conn.execute(sqlalchemy.text(f"DROP TABLE `{tmp}`"))
         data.to_sql(table, conn, if_exists='append', index=False)
     return len(data)
 
 
 def replace(engine, table, data):
-    """Dành cho bảng snapshot (cổ đông) — luôn thay toàn bộ."""
+    """Thay toàn bộ bảng: dùng cho bảng snapshot (cổ đông) hoặc khi --rebuild."""
     with engine.begin() as conn:
         data.to_sql(table, conn, if_exists='replace', index=False)

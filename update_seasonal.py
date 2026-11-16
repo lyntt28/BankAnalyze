@@ -1,10 +1,15 @@
+"""Đẩy các bảng theo kỳ & cổ đông lên database SEASONAL.
+
+Bảng theo kỳ: upsert theo khoá (hoặc thay toàn bộ với --rebuild).
+Bảng cổ đông là snapshot: luôn thay toàn bộ.
+"""
+import argparse
+
 import pandas as pd
-from tqdm import tqdm
 
 from db import get_engine, replace, upsert
 from utils import log, result_path
 
-# Bảng theo kỳ -> upsert theo khoá; bảng cổ đông là snapshot -> replace.
 TABLES = {
     'no-nhom-theo-nam': ['year', 'group', 'bank'],
     'no-nhom-theo-quy': ['season', 'group', 'bank'],
@@ -14,14 +19,18 @@ TABLES = {
     'co-dong-nuoc-ngoai': None,
 }
 
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--rebuild', action='store_true')
+args = p.parse_args()
+
 engine = get_engine("SEASONAL")
-for name, keys in tqdm(TABLES.items()):
+for name, keys in TABLES.items():
     try:
         data = pd.read_csv(result_path(f'{name}.csv'))
     except FileNotFoundError:
         log.warning("Không có %s.csv, bỏ qua", name)
         continue
-    if keys:
+    if keys and not args.rebuild:
         upsert(engine, name, data, keys)
     else:
         replace(engine, name, data)

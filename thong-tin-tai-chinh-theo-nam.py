@@ -1,16 +1,5 @@
-from _cafef_common import crawl, save
-from config import FINANCE_REMOVE_LIST
-from utils import parse_feature_line
+from cafef_periodic import YEAR, run
+from utils import cli
 
-
-def extract(text, bank):
-    lines = [l for l in text.split('\n') if l not in FINANCE_REMOVE_LIST]
-    years = [l.replace('Năm ', '').strip() for l in lines[:4]]
-    rows = [parse_feature_line(line, bank, lambda t: ',' in t)
-            for line in lines[4:]]
-    return years, rows
-
-
-data = crawl('//*[@id="divHoSoCongTyAjax"]', extract, scroll=2500)
-save(data, 'thong-tin-tai-chinh-theo-nam.csv', 'year',
-     ["year", "value", "group", "bank"])
+if __name__ == '__main__':
+    run('finance', YEAR, cli(__doc__ or 'thong-tin-tai-chinh theo nam'))
