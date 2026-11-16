@@ -1,0 +1,84 @@
+# Tự crawl dữ liệu theo lịch, commit CSV vào results/, và (nếu đã cấu hình
+# secrets) đẩy lên Cloud SQL.
+#
+# Secrets (Settings > Secrets and variables > Actions), chỉ cần nếu muốn đẩy DB:
+#   GCP_SA_KEY                JSON key của service account có quyền Cloud SQL Client
+#   INSTANCE_CONNECTION_NAME  project:region:instance
+#   DB_USER, DB_PASS
+name: Update data
+on:
+  schedule:
+    - cron: "17 10 * * 1-5"   # 17:17 giờ VN, thứ 2-6 (sau giờ đóng cửa)
+    - cron: "43 1 * * 1"      # 08:43 giờ VN thứ 2: dữ liệu theo quý & cổ đông
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "daily | seasonal | all"
+        default: all
+      full:
+        description: "Lấy toàn bộ lịch sử (--full)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || (github.event.schedule == '43 1 * * 1' && 'seasonal' || 'daily') }}
+      FULL: ${{ inputs.full && '--full' || '' }}
+      HAS_DB: ${{ secrets.GCP_SA_KEY != '' && secrets.DB_PASS != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Crawl daily
+        if: env.SCOPE != 'seasonal'
+        run: python stock_history.py $FULL
+
+      - name: Crawl seasonal
+        if: env.SCOPE != 'daily'
+        run: |
+          status=0
+          for s in no-nhom-theo-quy no-nhom-theo-nam \
+                   thong-tin-tai-chinh-theo-quy thong-tin-tai-chinh-theo-nam \
+                   shareholder; do
+            python "$s.py" $FULL || status=1
+          done
+          exit $status
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/
+          if git diff --cached --quiet; then echo "Không có dữ liệu mới"; exit 0; fi
+          git commit -m "data: cập nhật $SCOPE $(date -u +%F)"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 5; done
+
+      - uses: google-github-actions/auth@v2
+        if: env.HAS_DB == 'true'
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Push to database
+        if: env.HAS_DB == 'true'
+        env:
+          INSTANCE_CONNECTION_NAME: ${{ secrets.INSTANCE_CONNECTION_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+        run: |
+          if [ "$SCOPE" != seasonal ]; then python update_daily.py; fi
+          if [ "$SCOPE" != daily ]; then python update_seasonal.py; fi

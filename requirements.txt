@@ -1,0 +1,7 @@
+pandas>=2.0
+requests
+unidecode
+sqlalchemy>=2.0
+pymysql
+cloud-sql-python-connector[pymysql]
+python-dotenv

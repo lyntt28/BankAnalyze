@@ -1,62 +1,50 @@
-from selenium import webdriver
-from tqdm import tqdm
-from selenium.webdriver.common.by import By
+"""Cơ cấu cổ đông lớn & tỷ lệ sở hữu nước ngoài/nhà nước (nguồn: cafef).
+
+Đây là dữ liệu snapshot: mỗi lần chạy ghi lại toàn bộ, kèm ngày crawl.
+"""
+from datetime import date
+
 import pandas as pd
-from tqdm import tqdm
-from time import sleep
-import re
-import random as rd
-from unidecode import unidecode
-from bs4 import BeautifulSoup  
 
-BANKS_CODE = ['ACB', 'BID', 'CTG', 'EIB', 'HDB', 
-              'LVB', 'MBB', 'MSB', 'OCB', 'STB', 
-              'SSB', 'TCB', 'TPB', 'VCB', 'VIB', 
-              'VPB']
+from config import BANKS_CODE
+from utils import cafef_get, cli, finish, for_each_bank, log, result_path
 
-driver = webdriver.Firefox()
-global_shareholder_df = pd.DataFrame()
-global_foreign_df = pd.DataFrame()
-for bank in tqdm(BANKS_CODE):
-    if bank=='LVB':
-        bank = 'LPB'
-    sleep(rd.randint(15,30))
-    crawl_url = f"https://dstock.vndirect.com.vn/tong-quan/{bank}/co-cau-so-huu-popup?tabDefault=shareholders"
-    driver.get(crawl_url)
-    sleep(rd.randint(15,30))
-    driver.execute_script("window.scrollTo(0, 2300)") 
-    sleep(rd.randint(15,30))
-    
-    shareholder_df = pd.DataFrame(columns=['shareholder_name', 'number', 'own_(%)'])
-    html_text = driver.page_source
-    soup = BeautifulSoup(html_text, "html.parser")
-    text_elements = soup.find_all('td', class_='text-left')
-    values_elements = soup.find_all('td', class_='nowrap')
-    flag = 0
-    for shareholder in tqdm(text_elements):
-        shareholder_name = shareholder.get_text()
-        number = values_elements[flag].get_text()
-        flag+=1
-        own_number = values_elements[flag].get_text().replace('%','')
-        flag+=1
-        shareholder_df.loc[len(shareholder_df)] = [shareholder_name, number, own_number]
-    xpath_path = """Sở hữu NN"""
-    element = driver.find_element(By.LINK_TEXT, xpath_path)
-    element.click()
-    sleep(rd.randint(15,30))
-    shareholder_df['Bank'] = bank
-    
-    html_text = driver.page_source
-    soup = BeautifulSoup(html_text, "html.parser")
-    text_elements = soup.find_all('td', class_='text-left')
-    values_elements = soup.find_all('td', class_='nowrap')
-    text_elements = [i.get_text() for i in text_elements]
-    values_elements = [i.get_text().replace('%','') for i in values_elements]
-    foreign_df = pd.DataFrame.from_dict({'metric': text_elements, 'own_(%)': values_elements})
-    foreign_df['Bank'] = bank
-    
-    global_shareholder_df = pd.concat([global_shareholder_df, shareholder_df], axis=0)
-    global_foreign_df = pd.concat([global_foreign_df, foreign_df], axis=0)
-    global_foreign_df.to_csv('results/co-dong-nuoc-ngoai.csv', index=False)
-    global_shareholder_df.to_csv('results/co-dong-tong-quan.csv', index=False)
-driver.close()
+OWNER_TYPES = {'NuocNgoai': 'nuoc-ngoai', 'NhaNuoc': 'nha-nuoc', 'Khac': 'khac'}
+
+
+def vn_number(text):
+    """'203.077.983' -> 203077983 ; '3,5' -> 3.5"""
+    if text is None or text == '':
+        return None
+    return float(str(text).replace('.', '').replace(',', '.'))
+
+
+def fetch(bank):
+    data = cafef_get('CoCauSoHuu.ashx', Symbol=bank)
+    holders = [[h['Name'], vn_number(h['AssetVolume']), vn_number(h['AssetRate']),
+                h['UpdatedDate'], bank] for h in data.get('CoDongSoHuu') or []]
+    owners = [[label, data.get(key), bank] for key, label in OWNER_TYPES.items()]
+    log.info("%s: %d cổ đông lớn", bank, len(holders))
+    return holders, owners
+
+
+def main():
+    args = cli(__doc__)
+    results, failed = for_each_bank(args.banks or BANKS_CODE, fetch)
+    today = date.today().isoformat()
+    holders = pd.DataFrame([h for r in results for h in r[0]],
+                           columns=['shareholder_name', 'number', 'own_(%)',
+                                    'updated_date', 'Bank'])
+    owners = pd.DataFrame([o for r in results for o in r[1]],
+                          columns=['metric', 'own_(%)', 'Bank'])
+    holders['crawl_date'] = owners['crawl_date'] = today
+    if failed:
+        # Không ghi đè snapshot cũ bằng dữ liệu thiếu ngân hàng
+        finish(failed)
+    holders.to_csv(result_path('co-dong-tong-quan.csv'), index=False)
+    owners.to_csv(result_path('co-dong-nuoc-ngoai.csv'), index=False)
+    log.info("Đã ghi %d cổ đông, %d dòng cơ cấu sở hữu", len(holders), len(owners))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,101 +1,87 @@
-import random as rd
+"""Lịch sử giá cổ phiếu hằng ngày của 16 ngân hàng (nguồn: cafef).
+
+Mặc định: lấy từ ngày cuối cùng đã có trong CSV (lùi lại 7 ngày để chắc chắn)
+tới hôm nay, nên lỡ vài ngày không chạy vẫn tự bù. Lần đầu (chưa có CSV) lấy
+1 năm gần nhất; dùng --full để lấy toàn bộ lịch sử từ 2010.
+"""
+import os
 import re
-from time import sleep
+from datetime import date, datetime, timedelta
 
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from tqdm import tqdm
 
-STOCK_CRAWL_URLS = """
-https://vn.investing.com/equities/asia-commercial-bank-historical-data
-https://vn.investing.com/equities/commercial-bank-investment-develop-historical-data
-https://vn.investing.com/equities/vietnam-joint-stock-commercial-bank-historical-data
-https://vn.investing.com/equities/vietnam-export-import-commercial-historical-data
-https://vn.investing.com/equities/ho-chi-minh-city-develop-historical-data
-https://vn.investing.com/equities/lien-viet-post-historical-data
-https://vn.investing.com/equities/military-commercial-bank-historical-data
-https://vn.investing.com/equities/vietnam-maritime-commercial-historical-data
-https://vn.investing.com/equities/orient-commercial-joint-stock-bank-historical-data
-https://vn.investing.com/equities/sai-gon-thuong-tin-commercial-historical-data
-https://vn.investing.com/equities/southeast-asia-commercial-bank-historical-data
-https://vn.investing.com/equities/vtc-bank-historical-data
-https://vn.investing.com/equities/tien-phong-commercial-historical-data
-https://vn.investing.com/equities/joint-stock-commercial-bank-historical-data
-https://vn.investing.com/equities/viet-nam-international-commercial-j-historical-data
-https://vn.investing.com/equities/vietnam-prosperity-historical-data
-""".split()
-BANKS_CODE = ['ACB', 'BID', 'CTG', 'EIB', 'HDB',
-              'LVB', 'MBB', 'MSB', 'OCB', 'STB',
-              'SSB', 'TCB', 'TPB', 'VCB', 'VIB',
-              'VPB']
-LINK_TO_BANK = dict(zip(STOCK_CRAWL_URLS, BANKS_CODE))
-driver = webdriver.Firefox()
+from config import BANKS_CODE
+from utils import cafef_get, cli, finish, for_each_bank, log, merge_incremental, result_path
+
+PATH = result_path('stock_history.csv')
+COLUMNS = ['Date', 'Close', 'Open', 'Highest', 'Lowest', 'KL', 'Change(%)',
+           'AdjClose', 'Value', 'Bank']
+FULL_START = date(2010, 1, 1)
+PCT_RE = re.compile(r'\(\s*([-+]?[\d.,]+)\s*%\s*\)')
 
 
-def update_dataframe(text: str, stock_history: pd.DataFrame):
-    lines = text.split('\n')
-    lines = [i for i in lines if len(re.findall('\d', i)) != 0][:-1]
-    for line in lines:
-        format_line = []
-        for i in line.split(' '):
-            if len(i) > 0:
-                if ')' not in i and '(' not in i:
-                    format_line.append(i)
-                else:
-                    format_line[-1] += i
-        stock_history.loc[len(stock_history)] = format_line
-    return stock_history
+def parse_pct(text):
+    m = PCT_RE.search(text or '')
+    return float(m.group(1).replace(',', '.')) if m else None
 
 
-stock_history = pd.DataFrame(columns=[
-    'Date', 'Close', 'Open', 'Highest',
-    'Lowest', 'KL',
-    'Change(%)', 'Bank'
-])
-for crawl_url in tqdm(STOCK_CRAWL_URLS):
-    sleep(rd.randint(15, 30))
-    driver.get(crawl_url)
-    sleep(rd.randint(15, 30))
-    driver.execute_script("window.scrollTo(0, 1000)")
-    sleep(rd.randint(15, 30))
-    xpath_path = '//*[@id="__next"]'
-    element = driver.find_element(By.XPATH, xpath_path)
-    text_split = element.text.split('\n')
-    lines = [i for i in text_split if '/2023' in i and ',' in i]
-    for line in lines[1:2]:
-        format_line = line.split()
-        format_line.append(LINK_TO_BANK.get(crawl_url))
-        stock_history.loc[len(stock_history)] = format_line
-driver.close()
+def fetch_range(bank, start, end):
+    """Lấy mọi phiên trong [start, end], tự phân trang."""
+    rows, page = [], 1
+    while True:
+        data = cafef_get('DataHistory/PriceHistory.ashx', Symbol=bank,
+                         StartDate=start.strftime('%m/%d/%Y'),
+                         EndDate=end.strftime('%m/%d/%Y'),
+                         PageIndex=page, PageSize=30)
+        items = data.get('Data') or []
+        for it in items:
+            rows.append([
+                datetime.strptime(it['Ngay'], '%d/%m/%Y').strftime('%Y-%m-%d'),
+                it['GiaDongCua'], it['GiaMoCua'], it['GiaCaoNhat'], it['GiaThapNhat'],
+                it['KhoiLuongKhopLenh'], parse_pct(it['ThayDoi']),
+                it['GiaDieuChinh'], it['GiaTriKhopLenh'], bank,
+            ])
+        if not items or len(rows) >= (data.get('TotalCount') or 0):
+            return rows
+        page += 1
 
 
-def KL_format(kl_str: str):
-    if 'M' in kl_str:
-        return float(kl_str.replace('M', ''))*10**6
-    elif 'K' in kl_str:
-        return float(kl_str.replace('K', ''))*10**3
+def last_dates():
+    if not os.path.exists(PATH):
+        return {}
+    old = pd.read_csv(PATH, usecols=['Date', 'Bank'])
+    old['Date'] = pd.to_datetime(old['Date'], format='mixed')
+    return old.groupby('Bank')['Date'].max().dt.date.to_dict()
+
+
+def fetch_bank(bank, full, known):
+    today = date.today()
+    if full:
+        start = FULL_START
+    elif bank in known:
+        start = known[bank] - timedelta(days=7)
     else:
-        return float(kl_str)
+        start = today - timedelta(days=365)
+    rows = []
+    # Chia theo năm để mỗi lượt phân trang ngắn
+    while start <= today:
+        end = min(date(start.year, 12, 31), today)
+        rows += fetch_range(bank, start, end)
+        start = end + timedelta(days=1)
+    log.info("%s: %d phiên", bank, len(rows))
+    return rows
 
 
-def float_format(float_value):
-    float_value = float_value.replace('%', '').replace(',', '')
-    return float(float_value)
+def main():
+    args = cli(__doc__)
+    known = last_dates()
+    results, failed = for_each_bank(args.banks or BANKS_CODE,
+                                    lambda b: fetch_bank(b, args.full, known))
+    df = pd.DataFrame([r for rows in results for r in rows], columns=COLUMNS)
+    if not df.empty:
+        merge_incremental(PATH, df, ['Date', 'Bank'], sort_cols=['Bank', 'Date'])
+    finish(failed)
 
 
-combine_data = pd.read_csv('results/stock_history.csv')
-combine_data['Date'] = pd.to_datetime(combine_data["Date"], format='%Y/%m/%d')
-data = stock_history.copy()
-data['KL'] = data['KL'].apply(KL_format)
-data['Close'] = data['Close'].apply(float_format)
-data['Open'] = data['Open'].apply(float_format)
-data['Highest'] = data['Highest'].apply(float_format)
-data['Lowest'] = data['Lowest'].apply(float_format)
-data['Change(%)'] = data['Change(%)'].apply(float_format)
-data['Date'] = pd.to_datetime(data["Date"], format='%d/%m/%Y')
-if data['Date'].max() <= combine_data['Date'].max():
-    print('Stock History is already updated')
-else:
-    combine_data = pd.concat([combine_data, data], axis=0)
-    combine_data.to_csv('results/stock_history.csv', index=False)
+if __name__ == '__main__':
+    main()

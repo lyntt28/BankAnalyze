@@ -1,0 +1,64 @@
+"""Kết nối Cloud SQL. Thông tin đăng nhập lấy từ biến môi trường / file .env,
+KHÔNG ghi trong code."""
+import os
+
+import sqlalchemy
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+def _env(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Thiếu biến môi trường {name} (xem .env.example)")
+    return value
+
+
+def get_engine(db_name):
+    from google.cloud.sql.connector import Connector  # chỉ cần khi kết nối thật
+    connector = Connector()
+
+    def getconn():
+        return connector.connect(
+            _env("INSTANCE_CONNECTION_NAME"), "pymysql",
+            user=_env("DB_USER"), password=_env("DB_PASS"), db=db_name)
+
+    return sqlalchemy.create_engine("mysql+pymysql://", creator=getconn)
+
+
+def upsert(engine, table, data, key_cols):
+    """Xoá các dòng trùng khoá với `data` rồi append, trong một transaction.
+
+    Không xoá cả bảng như `if_exists='replace'`; dữ liệu cũ không bị đụng tới.
+    """
+    insp = sqlalchemy.inspect(engine)
+    with engine.begin() as conn:
+        if not insp.has_table(table):
+            data.to_sql(table, conn, index=False)
+            return len(data)
+        existing = {c['name'] for c in insp.get_columns(table)}
+        for col in data.columns:
+            if col not in existing:  # schema mới có thêm cột -> tự thêm
+                conn.execute(sqlalchemy.text(
+                    f"ALTER TABLE `{table}` ADD COLUMN `{col}` TEXT NULL"))
+        keys = data[key_cols].drop_duplicates().astype(str)
+        tmp = f"_tmp_{table}"
+        keys.to_sql(tmp, conn, if_exists='replace', index=False)
+        cols = ", ".join(f"`{c}`" for c in key_cols)
+        # So khoá dạng chuỗi để không lệch kiểu giữa dữ liệu cũ và mới
+        lhs = ", ".join(f"CAST(`{c}` AS CHAR)" for c in key_cols)
+        conn.execute(sqlalchemy.text(
+            f"DELETE FROM `{table}` WHERE ({lhs}) IN (SELECT {cols} FROM `{tmp}`)"))
+        conn.execute(sqlalchemy.text(f"DROP TABLE `{tmp}`"))
+        data.to_sql(table, conn, if_exists='append', index=False)
+    return len(data)
+
+
+def replace(engine, table, data):
+    """Thay toàn bộ bảng: dùng cho bảng snapshot (cổ đông) hoặc khi --rebuild."""
+    with engine.begin() as conn:
+        data.to_sql(table, conn, if_exists='replace', index=False)

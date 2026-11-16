@@ -1,30 +1,23 @@
-import os
+"""Đẩy results/stock_history.csv lên database DAILY.
+
+Mặc định upsert theo (Date, Bank). --rebuild: thay toàn bộ bảng bằng CSV
+(dùng một lần sau khi crawl --full, để dọn dữ liệu định dạng cũ / mã LVB).
+"""
+import argparse
+
 import pandas as pd
-from tqdm import tqdm
-from google.cloud.sql.connector import Connector
-import sqlalchemy
 
-connector = Connector()
-INSTANCE_CONNECTION_NAME = "data-engineer-379601:asia-southeast1:bankstock"
-DB_USER = "dashboard"
-DB_PASS = "dashboard"
+from db import get_engine, replace, upsert
+from utils import log, result_path
 
-def getconn():
-    conn = connector.connect(
-        INSTANCE_CONNECTION_NAME,
-        "pymysql",
-        user=DB_USER,
-        password=DB_PASS,
-        db="DAILY"
-    )
-    return conn
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument('--rebuild', action='store_true')
+args = p.parse_args()
 
-pool = sqlalchemy.create_engine(
-    "mysql+pymysql://",
-    creator=getconn,
-)
-DB_CONN = pool.connect()
-file ='stock_history.csv'
-data = pd.read_csv('results/'+file)
-name = file.replace('.csv','')
-data.to_sql(name, DB_CONN, if_exists='replace', index=False)
+data = pd.read_csv(result_path('stock_history.csv'))
+engine = get_engine("DAILY")
+if args.rebuild:
+    replace(engine, 'stock_history', data)
+else:
+    upsert(engine, 'stock_history', data, ['Date', 'Bank'])
+log.info("stock_history: %d dòng", len(data))
